@@ -12,6 +12,9 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
+// ==========================================
+// AUTHENTICATION MIDDLEWARE
+// ==========================================
 const authenticateUser = async (req, res, next) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -25,9 +28,10 @@ const authenticateUser = async (req, res, next) => {
     return res.status(401).json({ error: 'Unauthorized session.' });
   }
 
+  // Fetch role, first_name, and last_name from user_profiles
   const { data: profile } = await supabase
     .from('user_profiles')
-    .select('role')
+    .select('role, first_name, last_name')
     .eq('id', user.id)
     .single();
 
@@ -40,7 +44,7 @@ const authenticateUser = async (req, res, next) => {
   } else {
     const { data: storeLinks } = await supabase
       .from('user_stores')
-      .select('store_id, stores(id, name, has_holiday_feature)')
+      .select('store_id, stores(id, name, has_holiday_feature, nickname, location, state, division)')
       .eq('user_id', user.id);
 
     stores = storeLinks ? storeLinks.map(s => s.stores) : [];
@@ -49,8 +53,26 @@ const authenticateUser = async (req, res, next) => {
   req.user = user;
   req.userRole = role;
   req.userStores = stores;
+  req.userProfile = {
+    first_name: profile?.first_name || '',
+    last_name: profile?.last_name || ''
+  };
   next();
 };
+
+
+
+// ==========================================
+// GENERAL AUTH & USER CONFIG ROUTES
+// ==========================================
+app.get('/api/auth/me', authenticateUser, (req, res) => {
+  res.json({
+    user: req.user,
+    role: req.userRole,
+    stores: req.userStores,
+    profile: req.userProfile
+  });
+});
 
 app.post('/api/user/assign-first-store', authenticateUser, async (req, res) => {
   const { storeId } = req.body;
@@ -86,86 +108,87 @@ app.post('/api/user/assign-first-store', authenticateUser, async (req, res) => {
   }
 });
 
-// Get saved feature menu selections only (NO prices here)
-app.get('/api/store-menu/:storeId', authenticateUser, async (req, res) => {
-  const { storeId } = req.params;
+// ==========================================
+// STORES CRUD ROUTES
+// ==========================================
+app.get('/api/stores', authenticateUser, async (req, res) => {
+  try {
+    const { data: stores, error } = await supabase
+      .from('stores')
+      .select('*')
+      .order('name');
+
+    if (error) throw error;
+    res.json({ stores: stores || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/stores', authenticateUser, async (req, res) => {
+  if (req.userRole !== 'superadmin') {
+    return res.status(403).json({ error: 'Superadmin permissions required.' });
+  }
+
+  const { name, nickname, location, state, division, has_holiday_feature } = req.body;
 
   try {
     const { data, error } = await supabase
-      .from('store_feature_menus')
-      .select('selected_item_ids')
-      .eq('store_id', storeId)
+      .from('stores')
+      .insert([{ name, nickname, location, state, division, has_holiday_feature: !!has_holiday_feature }])
+      .select()
       .single();
 
-    if (error && error.code !== 'PGRST116') {
-      throw error;
-    }
-
-    res.json(data || { selected_item_ids: [] });
+    if (error) throw error;
+    res.json({ success: true, store: data });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Save feature menu selections only (NO prices here)
-app.post('/api/store-menu/:storeId', authenticateUser, async (req, res) => {
-  const { storeId } = req.params;
-  const { selectedItemIds } = req.body;
+app.patch('/api/stores/:id', authenticateUser, async (req, res) => {
+  if (req.userRole !== 'superadmin') {
+    return res.status(403).json({ error: 'Superadmin permissions required.' });
+  }
+
+  const { id } = req.params;
+  const updates = req.body;
 
   try {
-    const { error } = await supabase
-      .from('store_feature_menus')
-      .upsert({
-        store_id: storeId,
-        selected_item_ids: selectedItemIds,
-        updated_at: new Date().toISOString(),
-      }, { onConflict: 'store_id' });
+    const { data, error } = await supabase
+      .from('stores')
+      .update(updates)
+      .eq('id', id)
+      .select()
+      .single();
 
     if (error) throw error;
-
-    res.json({ success: true, message: 'Store menu saved successfully.' });
+    res.json({ success: true, store: data });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Menu Price update (Handles all item prices, including 6oz and 9oz medallion base UUIDs)
-app.patch('/api/menu/price', authenticateUser, async (req, res) => {
-  const { storeId, itemId, price } = req.body;
-
-  if (!storeId || !itemId || price === undefined) {
-    return res.status(400).json({ error: 'Missing storeId, itemId, or price.' });
+app.delete('/api/stores/:id', authenticateUser, async (req, res) => {
+  if (req.userRole !== 'superadmin') {
+    return res.status(403).json({ error: 'Superadmin permissions required.' });
   }
+
+  const { id } = req.params;
 
   try {
-    const { error } = await supabase
-      .from('store_prices')
-      .upsert(
-        {
-          store_id: storeId,
-          item_id: itemId,
-          price: parseFloat(price) || 0,
-        },
-        { onConflict: 'store_id,item_id' }
-      );
-
+    const { error } = await supabase.from('stores').delete().eq('id', id);
     if (error) throw error;
-
-    res.json({ success: true, message: 'Price updated successfully.' });
+    res.json({ success: true, message: 'Store deleted successfully.' });
   } catch (err) {
-    console.error('Error saving item price:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-app.get('/api/auth/me', authenticateUser, (req, res) => {
-  res.json({
-    user: req.user,
-    role: req.userRole,
-    stores: req.userStores
-  });
-});
 
+// ==========================================
+// MENU MANAGEMENT ROUTES
+// ==========================================
 app.get('/api/menu', authenticateUser, async (req, res) => {
   const { storeId } = req.query;
 
@@ -212,73 +235,290 @@ app.get('/api/menu', authenticateUser, async (req, res) => {
   }
 });
 
-app.post('/api/admin/users', authenticateUser, async (req, res) => {
+app.get('/api/menu/items', authenticateUser, async (req, res) => {
+  try {
+    const { data: items, error } = await supabase
+      .from('menu_items')
+      .select('*')
+      .order('section');
+
+    if (error) throw error;
+    res.json({ items: items || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/menu/items', authenticateUser, async (req, res) => {
   if (req.userRole !== 'admin' && req.userRole !== 'superadmin') {
     return res.status(403).json({ error: 'Admin permissions required.' });
   }
 
-  const { email, password, role, storeIds } = req.body;
+  const itemData = req.body;
 
-  if (role === 'superadmin' && req.userRole !== 'superadmin') {
-    return res.status(403).json({ error: 'Only Superadmins can assign Superadmin role.' });
+  try {
+    const { data, error } = await supabase
+      .from('menu_items')
+      .insert([itemData])
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json({ success: true, item: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
-
-  const { data: authData, error: authError } = await supabase.auth.admin.createUser({
-    email,
-    password,
-    email_confirm: true
-  });
-
-  if (authError) return res.status(400).json({ error: authError.message });
-
-  await supabase
-    .from('user_profiles')
-    .insert([{ id: authData.user.id, email: email.toLowerCase(), role: role || 'user' }]);
-
-  if (storeIds && storeIds.length > 0) {
-    const storeRows = storeIds.map(storeId => ({
-      user_id: authData.user.id,
-      store_id: storeId
-    }));
-    await supabase.from('user_stores').insert(storeRows);
-  }
-
-  res.json({ message: 'User created successfully', userId: authData.user.id });
 });
 
-app.post('/api/admin/reset-password', authenticateUser, async (req, res) => {
+app.patch('/api/menu/items/:id', authenticateUser, async (req, res) => {
   if (req.userRole !== 'admin' && req.userRole !== 'superadmin') {
     return res.status(403).json({ error: 'Admin permissions required.' });
   }
 
-  const { userId, newPassword } = req.body;
+  const { id } = req.params;
+  const updates = req.body;
 
-  if (!userId || !newPassword) {
-    return res.status(400).json({ error: 'User ID and new password are required.' });
+  try {
+    const { data, error } = await supabase
+      .from('menu_items')
+      .update(updates)
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json({ success: true, item: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/menu/items/:id', authenticateUser, async (req, res) => {
+  if (req.userRole !== 'admin' && req.userRole !== 'superadmin') {
+    return res.status(403).json({ error: 'Admin permissions required.' });
   }
 
-  const { error } = await supabase.auth.admin.updateUserById(userId, {
-    password: newPassword
-  });
+  const { id } = req.params;
 
-  if (error) return res.status(400).json({ error: error.message });
-
-  res.json({ message: 'Password updated successfully.' });
+  try {
+    const { error } = await supabase.from('menu_items').delete().eq('id', id);
+    if (error) throw error;
+    res.json({ success: true, message: 'Menu item deleted successfully.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
+
+app.get('/api/store-menu/:storeId', authenticateUser, async (req, res) => {
+  const { storeId } = req.params;
+
+  try {
+    const { data, error } = await supabase
+      .from('store_feature_menus')
+      .select('selected_item_ids')
+      .eq('store_id', storeId)
+      .single();
+
+    if (error && error.code !== 'PGRST116') {
+      throw error;
+    }
+
+    res.json(data || { selected_item_ids: [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/store-menu/:storeId', authenticateUser, async (req, res) => {
+  const { storeId } = req.params;
+  const { selectedItemIds } = req.body;
+
+  try {
+    const { error } = await supabase
+      .from('store_feature_menus')
+      .upsert({
+        store_id: storeId,
+        selected_item_ids: selectedItemIds,
+        updated_at: new Date().toISOString(),
+      }, { onConflict: 'store_id' });
+
+    if (error) throw error;
+
+    res.json({ success: true, message: 'Store menu saved successfully.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch('/api/menu/price', authenticateUser, async (req, res) => {
+  const { storeId, itemId, price } = req.body;
+
+  if (!storeId || !itemId || price === undefined) {
+    return res.status(400).json({ error: 'Missing storeId, itemId, or price.' });
+  }
+
+  try {
+    const { error } = await supabase
+      .from('store_prices')
+      .upsert(
+        {
+          store_id: storeId,
+          item_id: itemId,
+          price: parseFloat(price) || 0,
+        },
+        { onConflict: 'store_id,item_id' }
+      );
+
+    if (error) throw error;
+
+    res.json({ success: true, message: 'Price updated successfully.' });
+  } catch (err) {
+    console.error('Error saving item price:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ==========================================
+// USER & ADMIN MANAGEMENT CRUD ROUTES
+// ==========================================
 
 app.get('/api/admin/users', authenticateUser, async (req, res) => {
   if (req.userRole !== 'admin' && req.userRole !== 'superadmin') {
     return res.status(403).json({ error: 'Admin permissions required.' });
   }
 
-  const { data: profiles, error } = await supabase
-    .from('user_profiles')
-    .select('id, email, role, created_at, user_stores(store_id, stores(name))');
+  try {
+    const { data: profiles, error } = await supabase
+      .from('user_profiles')
+      .select('id, first_name, last_name, email, role, created_at, user_stores(store_id, stores(id, name))');
 
-  if (error) return res.status(500).json({ error: error.message });
+    if (error) throw error;
 
-  res.json({ users: profiles || [] });
+    const formattedUsers = (profiles || []).map(u => ({
+      ...u,
+      store_ids: u.user_stores ? u.user_stores.map(us => us.store_id) : []
+    }));
+
+    res.json({ users: formattedUsers });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
+app.post('/api/admin/users', authenticateUser, async (req, res) => {
+  if (req.userRole !== 'admin' && req.userRole !== 'superadmin') {
+    return res.status(403).json({ error: 'Admin permissions required.' });
+  }
+
+  const { email, password, first_name, last_name, role, store_ids } = req.body;
+
+  if (role === 'superadmin' && req.userRole !== 'superadmin') {
+    return res.status(403).json({ error: 'Only Superadmins can assign Superadmin role.' });
+  }
+
+  try {
+    const { data: authData, error: authError } = await supabase.auth.admin.createUser({
+      email,
+      password,
+      email_confirm: true
+    });
+
+    if (authError) return res.status(400).json({ error: authError.message });
+
+    const userId = authData.user.id;
+
+    // Insert profile with first_name, last_name, email, and role
+    await supabase
+      .from('user_profiles')
+      .insert([{ 
+        id: userId, 
+        email: email.toLowerCase(), 
+        first_name: first_name || '',
+        last_name: last_name || '',
+        role: role || 'user' 
+      }]);
+
+    if (store_ids && store_ids.length > 0) {
+      const storeRows = store_ids.map(storeId => ({
+        user_id: userId,
+        store_id: storeId
+      }));
+      await supabase.from('user_stores').insert(storeRows);
+    }
+
+    res.json({ success: true, message: 'User created successfully', userId });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch('/api/admin/users/:id', authenticateUser, async (req, res) => {
+  if (req.userRole !== 'admin' && req.userRole !== 'superadmin') {
+    return res.status(403).json({ error: 'Admin permissions required.' });
+  }
+
+  const { id } = req.params;
+  const { first_name, last_name, role, store_ids, password } = req.body;
+
+  try {
+    if (password) {
+      const { error: passError } = await supabase.auth.admin.updateUserById(id, { password });
+      if (passError) return res.status(400).json({ error: passError.message });
+    }
+
+    const profileUpdates = {};
+    if (first_name !== undefined) profileUpdates.first_name = first_name;
+    if (last_name !== undefined) profileUpdates.last_name = last_name;
+    if (role !== undefined && req.userRole === 'superadmin') profileUpdates.role = role;
+
+    if (Object.keys(profileUpdates).length > 0) {
+      const { error: profileError } = await supabase
+        .from('user_profiles')
+        .update(profileUpdates)
+        .eq('id', id);
+
+      if (profileError) throw profileError;
+    }
+
+    if (store_ids !== undefined) {
+      await supabase.from('user_stores').delete().eq('user_id', id);
+
+      if (store_ids.length > 0) {
+        const storeRows = store_ids.map(storeId => ({
+          user_id: id,
+          store_id: storeId
+        }));
+        await supabase.from('user_stores').insert(storeRows);
+      }
+    }
+
+    res.json({ success: true, message: 'User updated successfully.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/admin/users/:id', authenticateUser, async (req, res) => {
+  if (req.userRole !== 'admin' && req.userRole !== 'superadmin') {
+    return res.status(403).json({ error: 'Admin permissions required.' });
+  }
+
+  const { id } = req.params;
+
+  try {
+    const { error } = await supabase.auth.admin.deleteUser(id);
+    if (error) throw error;
+
+    res.json({ success: true, message: 'User deleted successfully.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ==========================================
+// START SERVER
+// ==========================================
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Backend server running on port ${PORT}`));
