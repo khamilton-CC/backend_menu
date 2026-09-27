@@ -4,7 +4,10 @@ const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
 
 const app = express();
+
+// Enable CORS for all routes and HTTP methods
 app.use(cors());
+
 app.use(express.json());
 
 const supabase = createClient(
@@ -16,97 +19,55 @@ const supabase = createClient(
 // AUTHENTICATION MIDDLEWARE
 // ==========================================
 const authenticateUser = async (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Missing authorization token.' });
-  }
-
-  const token = authHeader.split(' ')[1];
-  const { data: { user }, error } = await supabase.auth.getUser(token);
-
-  if (error || !user) {
-    return res.status(401).json({ error: 'Unauthorized session.' });
-  }
-
-  // Fetch role, first_name, and last_name from user_profiles
-  const { data: profile } = await supabase
-    .from('user_profiles')
-    .select('role, first_name, last_name')
-    .eq('id', user.id)
-    .single();
-
-  const role = profile?.role || 'user';
-  let stores = [];
-
-  if (role === 'superadmin') {
-    const { data: allStores } = await supabase.from('stores').select('*');
-    stores = allStores || [];
-  } else {
-    const { data: storeLinks } = await supabase
-      .from('user_stores')
-      .select('store_id, stores(id, name, has_holiday_feature, nickname, location, state, division)')
-      .eq('user_id', user.id);
-
-    stores = storeLinks ? storeLinks.map(s => s.stores) : [];
-  }
-
-  req.user = user;
-  req.userRole = role;
-  req.userStores = stores;
-  req.userProfile = {
-    first_name: profile?.first_name || '',
-    last_name: profile?.last_name || ''
-  };
-  next();
-};
-
-
-
-// ==========================================
-// GENERAL AUTH & USER CONFIG ROUTES
-// ==========================================
-app.get('/api/auth/me', authenticateUser, (req, res) => {
-  res.json({
-    user: req.user,
-    role: req.userRole,
-    stores: req.userStores,
-    profile: req.userProfile
-  });
-});
-
-app.post('/api/user/assign-first-store', authenticateUser, async (req, res) => {
-  const { storeId } = req.body;
-  const userId = req.user.id;
-
-  if (!storeId) {
-    return res.status(400).json({ error: 'Store ID is required.' });
-  }
-
   try {
-    const { data: existingStores, error: checkError } = await supabase
-      .from('user_stores')
-      .select('store_id')
-      .eq('user_id', userId);
-
-    if (checkError) throw checkError;
-
-    if (existingStores && existingStores.length > 0) {
-      return res.status(403).json({ 
-        error: 'Store already selected. Contact a Superadmin to change your store assignment.' 
-      });
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: 'Missing authorization token.' });
     }
 
-    const { error: insertError } = await supabase
-      .from('user_stores')
-      .insert([{ user_id: userId, store_id: storeId }]);
+    const token = authHeader.split(' ')[1];
+    const { data: { user }, error } = await supabase.auth.getUser(token);
 
-    if (insertError) throw insertError;
+    if (error || !user) {
+      return res.status(401).json({ error: 'Unauthorized session.' });
+    }
 
-    res.json({ success: true, message: 'Primary store assigned successfully.' });
+    // Safely retrieve user profile without throwing PGRST116 single-row errors
+    const { data: profile } = await supabase
+      .from('user_profiles')
+      .select('role, first_name, last_name')
+      .eq('id', user.id)
+      .maybeSingle();
+
+    const role = profile?.role || 'user';
+    let stores = [];
+
+    if (role === 'superadmin') {
+      const { data: allStores } = await supabase.from('stores').select('*');
+      stores = allStores || [];
+    } else {
+      const { data: storeLinks } = await supabase
+        .from('user_stores')
+        .select('store_id, stores(id, name, has_holiday_feature, nickname, location, state, division)')
+        .eq('user_id', user.id);
+
+      stores = storeLinks ? storeLinks.map(s => s.stores).filter(Boolean) : [];
+    }
+
+    req.user = user;
+    req.userRole = role;
+    req.userStores = stores;
+    req.userProfile = {
+      first_name: profile?.first_name || '',
+      last_name: profile?.last_name || ''
+    };
+
+    next();
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Auth Middleware Error:', err);
+    return res.status(500).json({ error: 'Authentication processing failed.' });
   }
-});
+};
 
 // ==========================================
 // STORES CRUD ROUTES
@@ -185,6 +146,51 @@ app.delete('/api/stores/:id', authenticateUser, async (req, res) => {
   }
 });
 
+// ==========================================
+// GENERAL AUTH & USER CONFIG ROUTES
+// ==========================================
+app.get('/api/auth/me', authenticateUser, (req, res) => {
+  res.json({
+    user: req.user,
+    role: req.userRole,
+    stores: req.userStores,
+    profile: req.userProfile
+  });
+});
+
+app.post('/api/user/assign-first-store', authenticateUser, async (req, res) => {
+  const { storeId } = req.body;
+  const userId = req.user.id;
+
+  if (!storeId) {
+    return res.status(400).json({ error: 'Store ID is required.' });
+  }
+
+  try {
+    const { data: existingStores, error: checkError } = await supabase
+      .from('user_stores')
+      .select('store_id')
+      .eq('user_id', userId);
+
+    if (checkError) throw checkError;
+
+    if (existingStores && existingStores.length > 0) {
+      return res.status(403).json({ 
+        error: 'Store already selected. Contact a Superadmin to change your store assignment.' 
+      });
+    }
+
+    const { error: insertError } = await supabase
+      .from('user_stores')
+      .insert([{ user_id: userId, store_id: storeId }]);
+
+    if (insertError) throw insertError;
+
+    res.json({ success: true, message: 'Primary store assigned successfully.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // ==========================================
 // MENU MANAGEMENT ROUTES
@@ -378,11 +384,9 @@ app.patch('/api/menu/price', authenticateUser, async (req, res) => {
   }
 });
 
-
 // ==========================================
 // USER & ADMIN MANAGEMENT CRUD ROUTES
 // ==========================================
-
 app.get('/api/admin/users', authenticateUser, async (req, res) => {
   if (req.userRole !== 'admin' && req.userRole !== 'superadmin') {
     return res.status(403).json({ error: 'Admin permissions required.' });
@@ -428,7 +432,6 @@ app.post('/api/admin/users', authenticateUser, async (req, res) => {
 
     const userId = authData.user.id;
 
-    // Insert profile with first_name, last_name, email, and role
     await supabase
       .from('user_profiles')
       .insert([{ 
@@ -516,6 +519,10 @@ app.delete('/api/admin/users/:id', authenticateUser, async (req, res) => {
   }
 });
 
+// Fallback JSON 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: `Cannot ${req.method} ${req.originalUrl}` });
+});
 
 // ==========================================
 // START SERVER
