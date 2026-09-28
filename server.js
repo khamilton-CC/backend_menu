@@ -7,7 +7,6 @@ const app = express();
 
 // Enable CORS for all routes and HTTP methods
 app.use(cors());
-
 app.use(express.json());
 
 const supabase = createClient(
@@ -35,7 +34,7 @@ const authenticateUser = async (req, res, next) => {
     // Safely retrieve user profile without throwing PGRST116 single-row errors
     const { data: profile } = await supabase
       .from('user_profiles')
-      .select('role, first_name, last_name')
+      .select('role, first_name, last_name, primary_store_id')
       .eq('id', user.id)
       .maybeSingle();
 
@@ -59,7 +58,8 @@ const authenticateUser = async (req, res, next) => {
     req.userStores = stores;
     req.userProfile = {
       first_name: profile?.first_name || '',
-      last_name: profile?.last_name || ''
+      last_name: profile?.last_name || '',
+      primary_store_id: profile?.primary_store_id || null
     };
 
     next();
@@ -167,6 +167,7 @@ app.post('/api/user/assign-first-store', authenticateUser, async (req, res) => {
   }
 
   try {
+    // 1. Guard against users who already have store assignments
     const { data: existingStores, error: checkError } = await supabase
       .from('user_stores')
       .select('store_id')
@@ -180,21 +181,127 @@ app.post('/api/user/assign-first-store', authenticateUser, async (req, res) => {
       });
     }
 
+    // 2. Insert store junction record into user_stores
     const { error: insertError } = await supabase
       .from('user_stores')
       .insert([{ user_id: userId, store_id: storeId }]);
 
     if (insertError) throw insertError;
 
-    res.json({ success: true, message: 'Primary store assigned successfully.' });
+    // 3. Update or create primary_store_id in user_profiles
+    const { error: profileError } = await supabase
+      .from('user_profiles')
+      .upsert(
+        { id: userId, primary_store_id: storeId },
+        { onConflict: 'id' }
+      );
+
+    if (profileError) throw profileError;
+
+    return res.json({ success: true, message: 'Primary store assigned successfully.' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Error assigning primary store:', err.message);
+    return res.status(500).json({ error: err.message || 'Internal server error.' });
   }
 });
 
 // ==========================================
-// MENU MANAGEMENT ROUTES
+// MENU MANAGEMENT ROUTES & HANDLERS
 // ==========================================
+
+// GET all menu items
+const getMenuItemsHandler = async (req, res) => {
+  try {
+    const { data: items, error } = await supabase
+      .from('menu_items')
+      .select('*')
+      .order('short_name');
+
+    if (error) throw error;
+    res.json({ items: items || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+app.get('/api/menu/items', authenticateUser, getMenuItemsHandler);
+app.get('/api/admin/menu-items', authenticateUser, getMenuItemsHandler);
+
+// POST create new menu item
+const createMenuItemHandler = async (req, res) => {
+  if (req.userRole !== 'admin' && req.userRole !== 'superadmin') {
+    return res.status(403).json({ error: 'Admin permissions required.' });
+  }
+
+  const itemData = req.body;
+
+  try {
+    const { data, error } = await supabase
+      .from('menu_items')
+      .insert([itemData])
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json({ success: true, item: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+app.post('/api/menu/items', authenticateUser, createMenuItemHandler);
+app.post('/api/admin/menu-items', authenticateUser, createMenuItemHandler);
+
+// PUT / PATCH update existing menu item
+const updateMenuItemHandler = async (req, res) => {
+  if (req.userRole !== 'admin' && req.userRole !== 'superadmin') {
+    return res.status(403).json({ error: 'Admin permissions required.' });
+  }
+
+  const { id } = req.params;
+  const updates = req.body;
+
+  try {
+    const { data, error } = await supabase
+      .from('menu_items')
+      .update(updates)
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json({ success: true, item: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+app.patch('/api/menu/items/:id', authenticateUser, updateMenuItemHandler);
+app.put('/api/menu/items/:id', authenticateUser, updateMenuItemHandler);
+app.patch('/api/admin/menu-items/:id', authenticateUser, updateMenuItemHandler);
+app.put('/api/admin/menu-items/:id', authenticateUser, updateMenuItemHandler);
+
+// DELETE menu item
+const deleteMenuItemHandler = async (req, res) => {
+  if (req.userRole !== 'admin' && req.userRole !== 'superadmin') {
+    return res.status(403).json({ error: 'Admin permissions required.' });
+  }
+
+  const { id } = req.params;
+
+  try {
+    const { error } = await supabase.from('menu_items').delete().eq('id', id);
+    if (error) throw error;
+    res.json({ success: true, message: 'Menu item deleted successfully.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+app.delete('/api/menu/items/:id', authenticateUser, deleteMenuItemHandler);
+app.delete('/api/admin/menu-items/:id', authenticateUser, deleteMenuItemHandler);
+
+// Menu & Pricing configuration routes
 app.get('/api/menu', authenticateUser, async (req, res) => {
   const { storeId } = req.query;
 
@@ -236,80 +343,6 @@ app.get('/api/menu', authenticateUser, async (req, res) => {
       prices,
       activeSelections
     });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/menu/items', authenticateUser, async (req, res) => {
-  try {
-    const { data: items, error } = await supabase
-      .from('menu_items')
-      .select('*')
-      .order('section');
-
-    if (error) throw error;
-    res.json({ items: items || [] });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/menu/items', authenticateUser, async (req, res) => {
-  if (req.userRole !== 'admin' && req.userRole !== 'superadmin') {
-    return res.status(403).json({ error: 'Admin permissions required.' });
-  }
-
-  const itemData = req.body;
-
-  try {
-    const { data, error } = await supabase
-      .from('menu_items')
-      .insert([itemData])
-      .select()
-      .single();
-
-    if (error) throw error;
-    res.json({ success: true, item: data });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.patch('/api/menu/items/:id', authenticateUser, async (req, res) => {
-  if (req.userRole !== 'admin' && req.userRole !== 'superadmin') {
-    return res.status(403).json({ error: 'Admin permissions required.' });
-  }
-
-  const { id } = req.params;
-  const updates = req.body;
-
-  try {
-    const { data, error } = await supabase
-      .from('menu_items')
-      .update(updates)
-      .eq('id', id)
-      .select()
-      .single();
-
-    if (error) throw error;
-    res.json({ success: true, item: data });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.delete('/api/menu/items/:id', authenticateUser, async (req, res) => {
-  if (req.userRole !== 'admin' && req.userRole !== 'superadmin') {
-    return res.status(403).json({ error: 'Admin permissions required.' });
-  }
-
-  const { id } = req.params;
-
-  try {
-    const { error } = await supabase.from('menu_items').delete().eq('id', id);
-    if (error) throw error;
-    res.json({ success: true, message: 'Menu item deleted successfully.' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -395,7 +428,7 @@ app.get('/api/admin/users', authenticateUser, async (req, res) => {
   try {
     const { data: profiles, error } = await supabase
       .from('user_profiles')
-      .select('id, first_name, last_name, email, role, created_at, user_stores(store_id, stores(id, name))');
+      .select('id, first_name, last_name, email, role, primary_store_id, created_at, user_stores(store_id, stores(id, name))');
 
     if (error) throw error;
 
@@ -415,7 +448,7 @@ app.post('/api/admin/users', authenticateUser, async (req, res) => {
     return res.status(403).json({ error: 'Admin permissions required.' });
   }
 
-  const { email, password, first_name, last_name, role, store_ids } = req.body;
+  const { email, password, first_name, last_name, role, primary_store_id, store_ids } = req.body;
 
   if (role === 'superadmin' && req.userRole !== 'superadmin') {
     return res.status(403).json({ error: 'Only Superadmins can assign Superadmin role.' });
@@ -439,7 +472,8 @@ app.post('/api/admin/users', authenticateUser, async (req, res) => {
         email: email.toLowerCase(), 
         first_name: first_name || '',
         last_name: last_name || '',
-        role: role || 'user' 
+        role: role || 'user',
+        primary_store_id: primary_store_id || null
       }]);
 
     if (store_ids && store_ids.length > 0) {
@@ -462,7 +496,7 @@ app.patch('/api/admin/users/:id', authenticateUser, async (req, res) => {
   }
 
   const { id } = req.params;
-  const { first_name, last_name, role, store_ids, password } = req.body;
+  const { first_name, last_name, role, primary_store_id, store_ids, password } = req.body;
 
   try {
     if (password) {
@@ -473,7 +507,12 @@ app.patch('/api/admin/users/:id', authenticateUser, async (req, res) => {
     const profileUpdates = {};
     if (first_name !== undefined) profileUpdates.first_name = first_name;
     if (last_name !== undefined) profileUpdates.last_name = last_name;
-    if (role !== undefined && req.userRole === 'superadmin') profileUpdates.role = role;
+    
+    // Restricted to superadmin actions
+    if (req.userRole === 'superadmin') {
+      if (role !== undefined) profileUpdates.role = role;
+      if (primary_store_id !== undefined) profileUpdates.primary_store_id = primary_store_id || null;
+    }
 
     if (Object.keys(profileUpdates).length > 0) {
       const { error: profileError } = await supabase
@@ -484,7 +523,7 @@ app.patch('/api/admin/users/:id', authenticateUser, async (req, res) => {
       if (profileError) throw profileError;
     }
 
-    if (store_ids !== undefined) {
+    if (store_ids !== undefined && req.userRole === 'superadmin') {
       await supabase.from('user_stores').delete().eq('user_id', id);
 
       if (store_ids.length > 0) {
