@@ -159,30 +159,16 @@ app.get('/api/auth/me', authenticateUser, (req, res) => {
 });
 
 app.post('/api/user/assign-first-store', authenticateUser, async (req, res) => {
-  const { storeId } = req.body;
+  const { storeId, first_name, last_name } = req.body;
   const userId = req.user.id;
+  const userEmail = req.user.email; // Extracted from authenticated user token
 
   if (!storeId) {
     return res.status(400).json({ error: 'Store ID is required.' });
   }
 
   try {
-    // 1. Check if user already has a primary store set in their profile
-    const { data: profile, error: profileCheckErr } = await supabase
-      .from('user_profiles')
-      .select('primary_store_id')
-      .eq('id', userId)
-      .maybeSingle();
-
-    if (profileCheckErr) throw profileCheckErr;
-
-    if (profile && profile.primary_store_id) {
-      return res.status(403).json({ 
-        error: 'Primary store already selected. Contact a Superadmin to change your store assignment.' 
-      });
-    }
-
-    // 2. Insert into user_stores junction table (use upsert or ignore duplicates if it exists)
+    // 1. Insert store junction record into user_stores
     const { error: insertError } = await supabase
       .from('user_stores')
       .upsert(
@@ -192,17 +178,24 @@ app.post('/api/user/assign-first-store', authenticateUser, async (req, res) => {
 
     if (insertError) throw insertError;
 
-    // 3. Update primary_store_id in user_profiles
-    const { error: updateError } = await supabase
+    // 2. Upsert primary_store_id, email, and names into user_profiles
+    const profileUpdates = {
+      id: userId,
+      email: userEmail, // Satisfies the NOT NULL constraint
+      primary_store_id: storeId,
+    };
+    if (first_name) profileUpdates.first_name = first_name;
+    if (last_name) profileUpdates.last_name = last_name;
+
+    const { error: profileError } = await supabase
       .from('user_profiles')
-      .update({ primary_store_id: storeId })
-      .eq('id', userId);
+      .upsert(profileUpdates, { onConflict: 'id' });
 
-    if (updateError) throw updateError;
+    if (profileError) throw profileError;
 
-    return res.json({ success: true, message: 'Primary store and store access assigned successfully.' });
+    return res.json({ success: true, message: 'Profile and primary store assigned successfully.' });
   } catch (err) {
-    console.error('Error assigning primary store:', err.message);
+    console.error('Error assigning first store:', err.message);
     return res.status(500).json({ error: err.message || 'Internal server error.' });
   }
 });
