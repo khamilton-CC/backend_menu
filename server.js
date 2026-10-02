@@ -297,6 +297,11 @@ app.delete('/api/menu/items/:id', authenticateUser, deleteMenuItemHandler);
 app.delete('/api/admin/menu-items/:id', authenticateUser, deleteMenuItemHandler);
 
 // Menu & Pricing configuration routes
+// ==========================================
+// MENU MANAGEMENT ROUTES & HANDLERS
+// ==========================================
+
+// GET all menu items & store selections
 app.get('/api/menu', authenticateUser, async (req, res) => {
   const { storeId } = req.query;
 
@@ -319,66 +324,81 @@ app.get('/api/menu', authenticateUser, async (req, res) => {
 
     if (pricesErr) throw pricesErr;
 
-    const { data: activeData, error: activeErr } = await supabase
-      .from('active_selections')
-      .select('item_id')
-      .eq('store_id', storeId);
-
-    if (activeErr) throw activeErr;
-
     const prices = {};
     (pricesData || []).forEach(p => {
       prices[p.item_id] = parseFloat(p.price);
     });
 
-    const activeSelections = (activeData || []).map(a => a.item_id);
-
     res.json({
       items: items || [],
       prices,
-      activeSelections
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+// GET saved feature menus (Lunch & Dinner columns) for a specific store
 app.get('/api/store-menu/:storeId', authenticateUser, async (req, res) => {
   const { storeId } = req.params;
 
   try {
     const { data, error } = await supabase
       .from('store_feature_menus')
-      .select('selected_item_ids')
+      .select('selected_item_ids, selected_item_ids_dinner')
       .eq('store_id', storeId)
-      .single();
+      .maybeSingle();
 
-    if (error && error.code !== 'PGRST116') {
-      throw error;
-    }
+    if (error) throw error;
 
-    res.json(data || { selected_item_ids: [] });
+    res.json({
+      selected_item_ids: data?.selected_item_ids || [],
+      selected_item_ids_dinner: data?.selected_item_ids_dinner || [],
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+// POST unified save for BOTH lunch and dinner feature menus
 app.post('/api/store-menu/:storeId', authenticateUser, async (req, res) => {
   const { storeId } = req.params;
-  const { selectedItemIds } = req.body;
+  const { lunchItemIds, dinnerItemIds, selectedItemIds, menuType } = req.body;
+
+  // Handle legacy or single payload requests gracefully just in case, 
+  // but prioritize our unified lunchItemIds/dinnerItemIds payload
+  let payloadLunch = lunchItemIds;
+  let payloadDinner = dinnerItemIds;
+
+  if (!payloadLunch && !payloadDinner && selectedItemIds) {
+    if (menuType === 'dinner') {
+      payloadDinner = selectedItemIds;
+    } else {
+      payloadLunch = selectedItemIds;
+    }
+  }
 
   try {
+    // Fetch existing record first so we don't overwrite one column with empty array if only one was passed
+    const { data: existing } = await supabase
+      .from('store_feature_menus')
+      .select('selected_item_ids, selected_item_ids_dinner')
+      .eq('store_id', storeId)
+      .maybeSingle();
+
+    const updateData = {
+      store_id: storeId,
+      selected_item_ids: payloadLunch !== undefined ? payloadLunch : (existing?.selected_item_ids || []),
+      selected_item_ids_dinner: payloadDinner !== undefined ? payloadDinner : (existing?.selected_item_ids_dinner || []),
+      updated_at: new Date().toISOString(),
+    };
+
     const { error } = await supabase
       .from('store_feature_menus')
-      .upsert({
-        store_id: storeId,
-        selected_item_ids: selectedItemIds,
-        updated_at: new Date().toISOString(),
-      }, { onConflict: 'store_id' });
+      .upsert(updateData, { onConflict: 'store_id' });
 
     if (error) throw error;
-
-    res.json({ success: true, message: 'Store menu saved successfully.' });
+    res.json({ success: true, message: 'Store feature menus saved successfully.' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
